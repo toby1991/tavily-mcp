@@ -11,8 +11,145 @@ import { hideBin } from 'yargs/helpers';
 
 dotenv.config();
 
-const API_KEY = process.env.TAVILY_API_KEY;
+/**
+ * Load API keys from environment variables.
+ * Priority: TAVILY_API_KEYS (JSON array) > TAVILY_API_KEY (single string)
+ */
+function loadApiKeys(): string[] {
+  const keysEnv = process.env.TAVILY_API_KEYS;
+  if (keysEnv) {
+    try {
+      const parsed = JSON.parse(keysEnv);
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((k: any) => typeof k === 'string' && k.trim())) {
+        return parsed.map((k: string) => k.trim());
+      }
+      console.warn('TAVILY_API_KEYS must be a JSON array of non-empty strings, falling back to TAVILY_API_KEY');
+    } catch {
+      console.warn(`Failed to parse TAVILY_API_KEYS as JSON array, falling back to TAVILY_API_KEY`);
+    }
+  }
+  const singleKey = process.env.TAVILY_API_KEY;
+  if (singleKey && singleKey.trim()) {
+    return [singleKey.trim()];
+  }
+  return [];
+}
 
+interface KeyState {
+  key: string;
+  status: 'active' | 'cooldown';
+  cooldownUntil: number;        // timestamp (ms), 0 = permanent (401 invalid key)
+  consecutiveFailures: number;
+}
+
+class KeyManager {
+  private keys: KeyState[];
+  private currentIndex: number = 0;
+  private readonly baseCooldownMs: number;
+
+  constructor(apiKeys: string[], cooldownMs?: number) {
+    this.baseCooldownMs = cooldownMs ?? (Number(process.env.TAVILY_KEY_COOLDOWN_MS) || 60000);
+    this.keys = apiKeys.map(key => ({
+      key,
+      status: 'active' as const,
+      cooldownUntil: 0,
+      consecutiveFailures: 0,
+    }));
+  }
+
+  /**
+   * Get the next available key using round-robin, skipping keys in cooldown.
+   * Lazily restores cooled-down keys whose cooldown period has expired.
+   * Throws if ALL keys are unavailable.
+   */
+  getNextKey(): string {
+    const now = Date.now();
+    const total = this.keys.length;
+
+    for (let i = 0; i < total; i++) {
+      const idx = (this.currentIndex + i) % total;
+      const ks = this.keys[idx];
+
+      if (ks.status === 'cooldown') {
+        // cooldownUntil === 0 means permanent (401 invalid key)
+        if (ks.cooldownUntil === 0) continue;
+        if (now >= ks.cooldownUntil) {
+          ks.status = 'active';
+          // keep consecutiveFailures so exponential backoff persists
+        } else {
+          continue;
+        }
+      }
+
+      this.currentIndex = (idx + 1) % total;
+      return ks.key;
+    }
+
+    throw new Error('All API keys are currently in cooldown. Please try again later or add more keys.');
+  }
+
+  /**
+   * Mark a key as failed after receiving 429 or 401.
+   * - 401: permanent cooldown (invalid key won't fix itself)
+   * - 429: exponential backoff cooldown based on consecutive failures
+   */
+  markFailed(key: string, statusCode: number): void {
+    const ks = this.keys.find(k => k.key === key);
+    if (!ks) return;
+
+    ks.consecutiveFailures++;
+    ks.status = 'cooldown';
+
+    if (statusCode === 401) {
+      // Permanent cooldown — invalid key
+      ks.cooldownUntil = 0;
+      console.error(`[KeyManager] Key ${this.maskKey(key)} permanently disabled (401 Invalid)`);
+    } else {
+      // 429 or other — exponential backoff
+      const backoffMultiplier = Math.pow(2, Math.min(ks.consecutiveFailures - 1, 6));
+      const cooldownMs = this.baseCooldownMs * backoffMultiplier;
+      ks.cooldownUntil = Date.now() + cooldownMs;
+      console.error(`[KeyManager] Key ${this.maskKey(key)} in cooldown for ${Math.round(cooldownMs / 1000)}s (${statusCode}, failures: ${ks.consecutiveFailures})`);
+    }
+  }
+
+  /** Mark a key as successfully used — resets consecutive failure count. */
+  markSuccess(key: string): void {
+    const ks = this.keys.find(k => k.key === key);
+    if (!ks) return;
+    ks.consecutiveFailures = 0;
+    ks.status = 'active';
+  }
+
+  /** Whether at least one key is currently available (not in cooldown). */
+  hasAvailableKeys(): boolean {
+    if (this.keys.length === 0) return false;
+    const now = Date.now();
+    return this.keys.some(ks => {
+      if (ks.status === 'active') return true;
+      if (ks.status === 'cooldown' && ks.cooldownUntil !== 0 && now >= ks.cooldownUntil) return true;
+      return false;
+    });
+  }
+
+  get totalKeys(): number {
+    return this.keys.length;
+  }
+
+  get activeKeys(): number {
+    const now = Date.now();
+    return this.keys.filter(ks => {
+      if (ks.status === 'active') return true;
+      if (ks.status === 'cooldown' && ks.cooldownUntil !== 0 && now >= ks.cooldownUntil) return true;
+      return false;
+    }).length;
+  }
+
+  private maskKey(key: string): string {
+    if (key.length <= 8) return '****';
+    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+  }
+}
 
 interface TavilyResponse {
   // Response structure from Tavily API
@@ -61,6 +198,7 @@ class TavilyClient {
   // Core client properties
   private server: Server;
   private axiosInstance;
+  private keyManager: KeyManager;
   private baseURLs = {
     search: 'https://api.tavily.com/search',
     extract: 'https://api.tavily.com/extract',
@@ -90,14 +228,16 @@ class TavilyClient {
       }
     );
 
+    // No fixed Authorization header — key is set per-request by KeyManager
     this.axiosInstance = axios.create({
       headers: {
         'accept': 'application/json',
         'content-type': 'application/json',
-        'Authorization': `Bearer ${API_KEY}`,
         'X-Client-Source': 'MCP'
       }
     });
+
+    this.keyManager = new KeyManager(loadApiKeys());
 
     this.setupHandlers();
     this.setupErrorHandling();
@@ -429,10 +569,16 @@ class TavilyClient {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
       // Check for API key at request time and return proper JSON-RPC error
-      if (!API_KEY) {
+      if (this.keyManager.totalKeys === 0) {
         throw new McpError(
           ErrorCode.InvalidRequest,
-          "TAVILY_API_KEY environment variable is required. Please set it before using this MCP server."
+          "TAVILY_API_KEY or TAVILY_API_KEYS environment variable is required. Please set it before using this MCP server."
+        );
+      }
+      if (!this.keyManager.hasAvailableKeys()) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          "All API keys are currently in cooldown. Please try again later or check your key validity."
         );
       }
 
@@ -568,10 +714,15 @@ class TavilyClient {
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error("Tavily MCP server running on stdio");
+    const keyCount = this.keyManager.totalKeys;
+    console.error(`Tavily MCP server running on stdio (${keyCount} API key${keyCount !== 1 ? 's' : ''} configured)`);
+    if (keyCount > 1) {
+      console.error("Key rotation: round-robin with smart cooldown enabled");
+    }
   }
 
   async search(params: any): Promise<TavilyResponse> {
+    const apiKey = this.keyManager.getNextKey();
     try {
       const endpoint = this.baseURLs.search;
       
@@ -593,7 +744,7 @@ class TavilyClient {
         include_favicon: params.include_favicon,
         start_date: params.start_date,
         end_date: params.end_date,
-        api_key: API_KEY,
+        api_key: apiKey,
       };
       
       // Apply default parameters
@@ -621,12 +772,17 @@ class TavilyClient {
         }
       }
       
-      const response = await this.axiosInstance.post(endpoint, cleanedParams);
+      const response = await this.axiosInstance.post(endpoint, cleanedParams, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      this.keyManager.markSuccess(apiKey);
       return response.data;
     } catch (error: any) {
       if (error.response?.status === 401) {
+        this.keyManager.markFailed(apiKey, 401);
         throw new Error(`Invalid API key. Documentation: ${this.docsURLs.search}`);
       } else if (error.response?.status === 429) {
+        this.keyManager.markFailed(apiKey, 429);
         throw new Error(`Usage limit exceeded. Documentation: ${this.docsURLs.search}`);
       }
       throw error;
@@ -634,16 +790,22 @@ class TavilyClient {
   }
 
   async extract(params: any): Promise<TavilyResponse> {
+    const apiKey = this.keyManager.getNextKey();
     try {
       const response = await this.axiosInstance.post(this.baseURLs.extract, {
         ...params,
-        api_key: API_KEY
+        api_key: apiKey
+      }, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
       });
+      this.keyManager.markSuccess(apiKey);
       return response.data;
     } catch (error: any) {
       if (error.response?.status === 401) {
+        this.keyManager.markFailed(apiKey, 401);
         throw new Error(`Invalid API key. Documentation: ${this.docsURLs.extract}`);
       } else if (error.response?.status === 429) {
+        this.keyManager.markFailed(apiKey, 429);
         throw new Error(`Usage limit exceeded. Documentation: ${this.docsURLs.extract}`);
       }
       throw error;
@@ -651,16 +813,22 @@ class TavilyClient {
   }
 
   async crawl(params: any): Promise<TavilyCrawlResponse> {
+    const apiKey = this.keyManager.getNextKey();
     try {
       const response = await this.axiosInstance.post(this.baseURLs.crawl, {
         ...params,
-        api_key: API_KEY
+        api_key: apiKey
+      }, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
       });
+      this.keyManager.markSuccess(apiKey);
       return response.data;
     } catch (error: any) {
       if (error.response?.status === 401) {
+        this.keyManager.markFailed(apiKey, 401);
         throw new Error(`Invalid API key. Documentation: ${this.docsURLs.crawl}`);
       } else if (error.response?.status === 429) {
+        this.keyManager.markFailed(apiKey, 429);
         throw new Error(`Usage limit exceeded. Documentation: ${this.docsURLs.crawl}`);
       }
       throw error;
@@ -668,16 +836,22 @@ class TavilyClient {
   }
 
   async map(params: any): Promise<TavilyMapResponse> {
+    const apiKey = this.keyManager.getNextKey();
     try {
       const response = await this.axiosInstance.post(this.baseURLs.map, {
         ...params,
-        api_key: API_KEY
+        api_key: apiKey
+      }, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
       });
+      this.keyManager.markSuccess(apiKey);
       return response.data;
     } catch (error: any) {
       if (error.response?.status === 401) {
+        this.keyManager.markFailed(apiKey, 401);
         throw new Error(`Invalid API key. Documentation: ${this.docsURLs.map}`);
       } else if (error.response?.status === 429) {
+        this.keyManager.markFailed(apiKey, 429);
         throw new Error(`Usage limit exceeded. Documentation: ${this.docsURLs.map}`);
       }
       throw error;
@@ -691,12 +865,16 @@ class TavilyClient {
     const MAX_PRO_MODEL_POLL_DURATION = 900000; // 15 minutes in ms
     const MAX_MINI_MODEL_POLL_DURATION = 300000; // 5 minutes in ms
 
+    // Pin the key for the entire research lifecycle (POST + polling GETs)
+    const apiKey = this.keyManager.getNextKey();
+    const authHeaders = { headers: { 'Authorization': `Bearer ${apiKey}` } };
+
     try {
       const response = await this.axiosInstance.post(this.baseURLs.research, {
         input: params.input,
         model: params.model || 'auto',
-        api_key: API_KEY
-      });
+        api_key: apiKey
+      }, authHeaders);
 
       const requestId = response.data.request_id;
       if (!requestId) {
@@ -717,13 +895,15 @@ class TavilyClient {
 
         try {
           const pollResponse = await this.axiosInstance.get(
-            `${this.baseURLs.research}/${requestId}`
+            `${this.baseURLs.research}/${requestId}`,
+            authHeaders
           );
 
           const status = pollResponse.data.status;
 
           if (status === 'completed') {
             const content = pollResponse.data.content;
+            this.keyManager.markSuccess(apiKey);
             return {
               content: content || ''
             };
@@ -746,8 +926,10 @@ class TavilyClient {
       return { error: `Research task timed out. Documentation: ${this.docsURLs.research}` };
     } catch (error: any) {
       if (error.response?.status === 401) {
+        this.keyManager.markFailed(apiKey, 401);
         throw new Error(`Invalid API key. Documentation: ${this.docsURLs.research}`);
       } else if (error.response?.status === 429) {
+        this.keyManager.markFailed(apiKey, 429);
         throw new Error(`Usage limit exceeded. Documentation: ${this.docsURLs.research}`);
       }
       throw error;
