@@ -49,6 +49,9 @@ class KeyManager {
 
   constructor(apiKeys: string[], cooldownMs?: number) {
     this.baseCooldownMs = cooldownMs ?? (Number(process.env.TAVILY_KEY_COOLDOWN_MS) || 60000);
+    // Randomize starting index so that frequent process restarts
+    // distribute requests evenly across all keys
+    this.currentIndex = apiKeys.length > 1 ? Math.floor(Math.random() * apiKeys.length) : 0;
     this.keys = apiKeys.map(key => ({
       key,
       status: 'active' as const,
